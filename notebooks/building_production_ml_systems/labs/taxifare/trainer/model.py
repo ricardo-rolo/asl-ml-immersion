@@ -2,10 +2,11 @@
 
 import logging
 import os
+import hypertune
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import callbacks, models
+from tensorflow.keras import callbacks,  models
 from tensorflow.keras.layers import (
     Concatenate,
     Dense,
@@ -37,7 +38,6 @@ UNWANTED_COLS = ["pickup_datetime", "key"]
 INPUT_COLS = [
     c for c in CSV_COLUMNS if c != LABEL_COLUMN and c not in UNWANTED_COLS
 ]
-
 
 def features_and_labels(row_data):
     for unwanted_col in UNWANTED_COLS:
@@ -83,7 +83,7 @@ def scale_latitude(lat_column):
     return (lat_column - 37) / 8.0
 
 
-def transform(inputs, nbuckets):
+def transform(inputs, nbuckets, embed_output_dim):
     transformed = {}
 
     # Scaling longitude from range [-70, -78] to [0, 1]
@@ -140,13 +140,13 @@ def transform(inputs, nbuckets):
 
     # Embedding with Embedding layer
     transformed["pd_embed"] = Flatten()(
-        Embedding(input_dim=nbuckets**4, output_dim=10, name="pd_embed")(
+        Embedding(input_dim=nbuckets**4, output_dim=embed_output_dim, name="pd_embed")(
             pd_fc
         )
     )
 
     transformed["passenger_count"] = inputs["passenger_count"]
-
+    
     return transformed
 
 
@@ -154,14 +154,14 @@ def rmse(y_true, y_pred):
     return tf.sqrt(tf.reduce_mean(tf.square(y_pred - y_true)))
 
 
-def build_dnn_model(nbuckets, nnsize, lr):  # pylint: disable=unused-argument
+def build_dnn_model(nbuckets, nnsize, lr, embed_output_dim):
     inputs = {
         colname: Input(name=colname, shape=(1,), dtype="float32")
         for colname in INPUT_COLS
     }
 
     # transforms
-    transformed = transform(inputs, nbuckets)
+    transformed = transform(inputs, nbuckets, embed_output_dim)
     dnn_inputs = Concatenate()(transformed.values())
 
     x = dnn_inputs
@@ -171,14 +171,32 @@ def build_dnn_model(nbuckets, nnsize, lr):  # pylint: disable=unused-argument
 
     model = models.Model(inputs, output)
 
-    # TODO 1a: Your code here
+    lr_optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    model.compile(optimizer=lr_optimizer, loss="mse", metrics=[rmse, "mse"])
 
     return model
 
+# # TODO 1
+hpt = hypertune.HyperTune() # TODO: Your code goes here
+
+
+# Reporting callback
+# TODO 1
+class HPTCallback(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        global hpt
+        hpt.report_hyperparameter_tuning_metric(
+            hyperparameter_metric_tag='rmse',
+            metric_value=logs["val_rmse"],
+            global_step=num_evals)
+        # TODO: Your code goes here
+
 
 def train_and_evaluate(hparams):
-    # TODO 1b: Your code here
-
+    batch_size = hparams["batch_size"]
+    nbuckets = hparams["nbuckets"]
+    embed_output_dim = hparams["embed_output_dim"]
+    lr = hparams["lr"]
     nnsize = [int(s) for s in hparams["nnsize"].split()]
     eval_data_path = hparams["eval_data_path"]
     num_evals = hparams["num_evals"]
@@ -193,21 +211,13 @@ def train_and_evaluate(hparams):
     if tf.io.gfile.exists(output_dir):
         tf.io.gfile.rmtree(output_dir)
 
-    model = build_dnn_model(
-        nbuckets, nnsize, lr  # pylint: disable=undefined-variable
-    )
+    model = build_dnn_model(nbuckets, nnsize, lr, embed_output_dim)
     logging.info(model.summary())
 
-    trainds = create_train_dataset(
-        train_data_path, batch_size  # pylint: disable=undefined-variable
-    )
-    evalds = create_eval_dataset(
-        eval_data_path, batch_size  # pylint: disable=undefined-variable
-    )
+    trainds = create_train_dataset(train_data_path, batch_size)
+    evalds = create_eval_dataset(eval_data_path, batch_size)
 
-    steps_per_epoch = num_examples_to_train_on // (
-        batch_size * num_evals  # pylint: disable=undefined-variable
-    )
+    steps_per_epoch = num_examples_to_train_on // (batch_size * num_evals)
 
     checkpoint_cb = callbacks.ModelCheckpoint(
         checkpoint_path, save_weights_only=True, verbose=1
@@ -220,7 +230,7 @@ def train_and_evaluate(hparams):
         epochs=num_evals,
         steps_per_epoch=max(1, steps_per_epoch),
         verbose=2,  # 0=silent, 1=progress bar, 2=one line per epoch
-        callbacks=[checkpoint_cb, tensorboard_cb],
+        callbacks=[checkpoint_cb, tensorboard_cb, HPTCallback()], #
     )
 
     # Exporting the model with default serving function.
